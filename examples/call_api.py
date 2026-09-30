@@ -204,6 +204,71 @@ def main() -> None:
     s, r = call("GET", f"/samples/{code2}/corrections")
     show("纠错审计查询", s, r)
 
+    # 12) 车次批量移交：同一车次多份样本一次提交，各份作为既有 transfer 事件原子落库
+    codes = [f"API-BATCH-{i}-{run_id}" for i in (1, 2)]
+    for i, bc in enumerate(codes, start=1):
+        call("POST", "/samples", {
+            "sample_code": bc,
+            "collected_at": "2026-09-30T01:00:00Z",
+            "collector": "王采集",
+            "seal_no": f"SEAL-BATCH-{i}",
+        })
+    batch_id = f"API-BATCH-{run_id}"
+    batch_body = {
+        "batch_id": batch_id,
+        "handed_over_at": "2026-09-30T02:00:00Z",   # 统一移交时间
+        "from_custodian": "王采集",                  # 交出人
+        "to_custodian": "李运输",                    # 接收人
+        "items": [
+            # 每份样本：编号 + 该份的事件号（全局唯一）+ 移交单号
+            {"sample_code": codes[0], "event_id": f"API-BE-T1-{run_id}", "transfer_no": "TR-BATCH-1"},
+            {"sample_code": codes[1], "event_id": f"API-BE-T2-{run_id}", "transfer_no": "TR-BATCH-2"},
+        ],
+    }
+    s, r = call("POST", "/transfer-batches", batch_body)
+    show("车次批量移交（201；逐份返回当前核验结论）", s, r)
+    for it in r.get("items", []):
+        print(f"  样本 {it['sample_code']}: 事件 {it['event_id']} 原事件有效={it['event_effective']}"
+              f" 当前结论={it['evaluation']['status']} 保管人={it['evaluation']['current_custodian']}")
+
+    # 12.1) 同批次号同内容重试 → 200 幂等（即使之后样本已核定也仍幂等）
+    s, r = call("POST", "/transfer-batches", batch_body)
+    show("同批次号同内容重试（200 幂等）", s, r, "idempotent")
+
+    # 12.2) 同批次号异内容 → 409 batch_conflict（整批失败，不留事件或批次）
+    bad_body = json.loads(json.dumps(batch_body, ensure_ascii=False))
+    bad_body["items"][1]["event_id"] = f"API-BE-T2-X-{run_id}"
+    s, r = call("POST", "/transfer-batches", bad_body)
+    show("同批次号异内容（409 batch_conflict）", s, r)
+
+    # 12.3) 批次查询：逐份样本的当前核验结论 + 原事件是否仍有效
+    s, r = call("GET", f"/transfer-batches/{batch_id}")
+    show("批次查询", s, r)
+
+    # 12.4) 批次列表概览
+    s, r = call("GET", "/transfer-batches")
+    print(f"\n--- 批次列表 [HTTP {s}] 共 {r['total']} 批；本批次份数数 ="
+          f" {[x['item_count'] for x in r['items'] if x['batch_id'] == batch_id]} ---")
+
+    # 12.5) 对批次内某份的原移交纠错（作废）：只改变有效链与批次查询结果，批次原始归属可追溯
+    s, r = call("POST", "/corrections", {
+        "correction_id": f"API-FIX-B-{run_id}",
+        "sample_code": codes[0],
+        "target_event_id": f"API-BE-T1-{run_id}",
+        "action": "void",
+        "operator": "质控员",
+        "reason": "批量移交中的该份记录作废",
+    })
+    show("对批次内原移交作废", s, r)
+    s, r = call("GET", f"/transfer-batches/{batch_id}")
+    it0 = [x for x in r["items"] if x["sample_code"] == codes[0]][0]
+    print(f"\n--- 作废后批次查询 [HTTP {s}] 样本 {it0['sample_code']}:"
+          f" 原事件有效={it0['event_effective']}（superseded_by={it0['superseded_by']}），"
+          f"当前结论={it0['evaluation']['status']}；批次归属仍可查 ---")
+    s, r = call("GET", f"/samples/{codes[0]}/chain")
+    print("证据链 superseded_events 中的批次归属:",
+          [(e["event_id"], e.get("batch_id")) for e in r["superseded_events"]])
+
 
 if __name__ == "__main__":
     main()

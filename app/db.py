@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS custody_event (
     content_hash       TEXT NOT NULL,                    -- 事件内容指纹（同事件号重试比对）
     created_at         TEXT NOT NULL,
     superseded_by      TEXT,                             -- 被哪条纠错作废/替换（NULL=当前有效版本）
-    replaces_event_id  TEXT                              -- 替换产生的新事件：指向被替换的原事件号
+    replaces_event_id  TEXT,                             -- 替换产生的新事件：指向被替换的原事件号
+    batch_pk           INTEGER REFERENCES transfer_batch(id) -- 车次批量移交产生的事件：原始批次归属（纠错不改变）
 );
 
 CREATE TABLE IF NOT EXISTS event_correction (
@@ -47,20 +48,32 @@ CREATE TABLE IF NOT EXISTS event_correction (
     created_at        TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS transfer_batch (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id        TEXT NOT NULL UNIQUE,                -- 全局唯一批次号（同一交接车次）
+    handed_over_at  TEXT NOT NULL,                       -- 统一移交时间（UTC ISO8601）
+    from_custodian  TEXT NOT NULL,                       -- 交出人
+    to_custodian    TEXT NOT NULL,                       -- 接收人
+    content_hash    TEXT NOT NULL,                       -- 整批内容指纹（同批次号幂等/冲突判定）
+    created_at      TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_event_sample_time ON custody_event(sample_id, occurred_at, id);
 """
 
-# 依赖纠错新列的索引（须在旧库补列迁移完成后再创建）
+# 索引（须在旧库补列迁移完成后再创建，故不放入 SCHEMA）
 POST_MIGRATION_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_event_effective ON custody_event(sample_id, superseded_by, occurred_at)",
     "CREATE INDEX IF NOT EXISTS idx_correction_sample ON event_correction(sample_id, id)",
+    "CREATE INDEX IF NOT EXISTS idx_event_batch ON custody_event(batch_pk)",
 ]
 
-# 旧库（本轮纠错能力之前的版本）增量补列
+# 旧库增量补列
 _MIGRATION_COLUMNS = {
     "custody_event": [
         ("superseded_by", "TEXT"),
         ("replaces_event_id", "TEXT"),
+        ("batch_pk", "INTEGER REFERENCES transfer_batch(id)"),
     ],
 }
 

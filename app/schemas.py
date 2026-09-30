@@ -131,3 +131,44 @@ class ApproveIn(BaseModel):
 
     approver: str = Field(..., min_length=1, description="核定操作人")
     note: str | None = Field(None, description="核定备注")
+
+
+class TransferBatchItemIn(BaseModel):
+    """车次批量移交中的一份样本：编号 + 该份移交的事件号与移交单号。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sample_code: str = Field(..., min_length=1, description="本份样本编号")
+    event_id: str = Field(..., min_length=1, description="本份移交的事件号，全局唯一（既有 transfer 事件）")
+    transfer_no: str = Field(..., min_length=1, description="本份移交单（移交凭证）号")
+
+
+class TransferBatchIn(BaseModel):
+    """同一交接车次多份样本的批量移交：整批一次提交、原子成败。
+
+    * 批内样本编号不得重复、事件号不得重复（结构校验失败 422，不落任何事件/批次）；
+      移交单号按样本各自核验，批内不要求唯一；
+    * 各份移交统一使用批次级 handed_over_at / from_custodian / to_custodian；
+    * 每份样本按既有 transfer 事件落库（事件内容与 5.2 单事件接口完全一致）；
+    * 同 batch_id 同内容重试幂等（200，即使样本已核定）；同 batch_id 异内容 409。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(..., min_length=1, description="全局唯一批次号（同一交接车次），同号重试幂等")
+    handed_over_at: datetime = Field(..., description="统一移交时间 ISO8601")
+    from_custodian: str = Field(..., min_length=1, description="交出人（须为每份样本当前保管人，否则核验判无效）")
+    to_custodian: str = Field(..., min_length=1, description="接收人")
+    items: list[TransferBatchItemIn] = Field(..., min_length=1, description="本车次涉及的每份样本")
+
+    @model_validator(mode="after")
+    def _check_batch_duplicates(self) -> "TransferBatchIn":
+        sample_codes = [it.sample_code for it in self.items]
+        dup_samples = sorted({c for c in sample_codes if sample_codes.count(c) > 1})
+        if dup_samples:
+            raise ValueError(f"批内样本编号重复: {', '.join(dup_samples)}")
+        event_ids = [it.event_id for it in self.items]
+        dup_events = sorted({e for e in event_ids if event_ids.count(e) > 1})
+        if dup_events:
+            raise ValueError(f"批内事件号重复: {', '.join(dup_events)}")
+        return self

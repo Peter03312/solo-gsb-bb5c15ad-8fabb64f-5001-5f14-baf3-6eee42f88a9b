@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import config
-from .schemas import ApproveIn, CorrectionIn, EventIn, NewEventIn, SampleIn
+from .schemas import ApproveIn, CorrectionIn, EventIn, NewEventIn, SampleIn, TransferBatchIn
 
 LAB_CUSTODIAN = "实验室"
 
@@ -62,6 +62,24 @@ def ensure_unlocked(sample: sqlite3.Row) -> None:
             "history_locked",
             f"样本 {sample['sample_code']} 已核定入库（{sample['approved_storage_at']}），历史记录冻结，禁止改写",
         )
+
+
+def evaluation_summary(result: dict[str, Any], sample: dict[str, Any]) -> dict[str, Any]:
+    """evaluate() 结果的对外摘要（列表/详情/批次逐份结论共用）。"""
+    return {
+        "sample_code": result["sample_code"],
+        "status": result["status"],
+        "reasons": result["reasons"],
+        "current_custodian": result["current_custodian"],
+        "pending_transfer": result["pending_transfer"],
+        "has_storage": result["has_storage"],
+        "event_count": result["event_count"],
+        "collected_at": sample["collected_at"],
+        "collector": sample["collector"],
+        "seal_no": sample["seal_no"],
+        "approved_storage_at": sample["approved_storage_at"],
+        "approved_by": sample["approved_by"],
+    }
 
 
 # --------------------------------------------------------------------------- 样本登记
@@ -233,6 +251,17 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
     invalid_reasons: list[str] = []
     timeline: list[dict[str, Any]] = []
 
+    # 事件原始批次归属映射（批量移交产生的事件可追溯到批次；纠错作废/替换不改变原归属）
+    batch_pks = {e["batch_pk"] for e in all_rows if e["batch_pk"] is not None}
+    batch_id_by_pk: dict[int, str] = {}
+    if batch_pks:
+        placeholders = ",".join("?" * len(batch_pks))
+        for br in conn.execute(
+            f"SELECT id, batch_id FROM transfer_batch WHERE id IN ({placeholders})",
+            tuple(batch_pks),
+        ):
+            batch_id_by_pk[br["id"]] = br["batch_id"]
+
     # 预索引全部移交单（含乱序补录），用于把"签收早于移交"与"单号根本不存在"区分开
     transfer_by_no: dict[str, dict[str, Any]] = {}
     for ev0 in events:
@@ -253,6 +282,7 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
                 "recorded_at": ev["created_at"],
                 "payload": p,
                 "replaces_event_id": ev["replaces_event_id"],
+                "batch_id": batch_id_by_pk.get(ev["batch_pk"]),
             }
         )
 
@@ -373,6 +403,7 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
             "payload": json.loads(ev["payload_json"]),
             "superseded_by": ev["superseded_by"],
             "replaces_event_id": ev["replaces_event_id"],
+            "batch_id": batch_id_by_pk.get(ev["batch_pk"]),
         }
         for ev in superseded_rows
     ]
@@ -579,3 +610,233 @@ def approve_storage(conn: sqlite3.Connection, sample_code: str, data: ApproveIn)
     result["approved_storage_at"] = approved_at
     result["approval"] = {"approved": True, "approved_at": approved_at, "approver": data.approver, "note": data.note}
     return result
+
+
+# --------------------------------------------------------------------------- 车次批量移交
+
+def _batch_canonical(data: TransferBatchIn) -> dict[str, Any]:
+    """整批内容的规范字典（参与批次指纹）。
+
+    items 按 (sample_code, event_id, transfer_no) 排序后参与指纹——批次是同一车次
+    多份移交的集合，重试时逐份排列顺序不同视为同内容幂等；落库与查询仍保留提交顺序。
+    每份事件的规范内容与单事件接口一致（transfer 必填三字段 + 统一移交时间与
+    交出/接收人），故批次内事件 content_hash 与 POST /events 完全相同，
+    两种入口可互相识别幂等/冲突。
+    """
+    handed_over = to_utc_iso(data.handed_over_at)
+    ordered = sorted(
+        ((it.sample_code, it.event_id, it.transfer_no) for it in data.items),
+        key=lambda x: (x[0], x[1], x[2]),
+    )
+    items = [
+        {
+            "sample_code": sample_code,
+            "event_id": event_id,
+            "event_type": "transfer",
+            "occurred_at": handed_over,
+            "transfer_no": transfer_no,
+            "from_custodian": data.from_custodian,
+            "to_custodian": data.to_custodian,
+        }
+        for sample_code, event_id, transfer_no in ordered
+    ]
+    return {
+        "batch_id": data.batch_id,
+        "handed_over_at": handed_over,
+        "from_custodian": data.from_custodian,
+        "to_custodian": data.to_custodian,
+        "items": items,
+    }
+
+
+def _get_batch(conn: sqlite3.Connection, batch_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM transfer_batch WHERE batch_id = ?", (batch_id,)
+    ).fetchone()
+
+
+def submit_transfer_batch(conn: sqlite3.Connection, data: TransferBatchIn) -> tuple[sqlite3.Row, bool]:
+    """同一交接车次多份样本的批量移交：各份作为既有 transfer 事件一次提交。
+
+    原子性：批内结构重复已由 Pydantic 拦截（422）；以下任一业务条件不满足，
+    整个批次失败并回滚——不留事件、不留批次：
+      * 任一样本不存在（404 sample_not_found）；
+      * 任一样本已核定入库（409 history_locked）；
+      * 任一事件号已被占用（409 event_conflict）。
+    幂等/冲突：同 batch_id 同内容重试 → 幂等（200，即使样本已核定）；
+              同 batch_id 异内容 → 409 batch_conflict。
+    返回 (批次行, 是否幂等重试)。
+    """
+    from .db import utcnow_iso
+
+    canonical = _batch_canonical(data)
+    h = _fingerprint(canonical)
+
+    # 1) 同批次号：同内容幂等（只读返回，不受核定冻结影响）/ 异内容冲突
+    existing = _get_batch(conn, data.batch_id)
+    if existing is not None:
+        if existing["content_hash"] != h:
+            raise DomainError(
+                409,
+                "batch_conflict",
+                f"批次号 {data.batch_id} 已使用但提交内容不一致（同批次号异内容冲突）",
+                {"batch_id": data.batch_id,
+                 "existing_content_hash": existing["content_hash"],
+                 "incoming_content_hash": h},
+            )
+        return existing, True
+
+    # 2) 全部样本必须存在且未核定（任一失败整批失败，事务由调用方回滚）
+    missing: list[str] = []
+    locked: list[dict[str, Any]] = []
+    sample_rows: dict[str, sqlite3.Row] = {}
+    for it in data.items:
+        row = conn.execute(
+            "SELECT * FROM sample WHERE sample_code = ?", (it.sample_code,)
+        ).fetchone()
+        if row is None:
+            missing.append(it.sample_code)
+            continue
+        sample_rows[it.sample_code] = row
+        if config.LOCK_AFTER_APPROVAL and row["approved_storage_at"]:
+            locked.append({"sample_code": it.sample_code,
+                           "approved_storage_at": row["approved_storage_at"]})
+    if missing:
+        raise DomainError(
+            404,
+            "sample_not_found",
+            f"批次含不存在的样本: {', '.join(missing)}（整批失败，不落任何事件或批次）",
+            {"missing_sample_codes": missing},
+        )
+    if locked:
+        raise DomainError(
+            409,
+            "history_locked",
+            f"批次含已核定入库的样本: {', '.join(x['sample_code'] for x in locked)}"
+            "（整批失败，不落任何事件或批次）",
+            {"locked_samples": locked},
+        )
+
+    # 3) 任一事件号已占用（含被纠错留痕的旧号）→ 整批失败
+    occupied: list[dict[str, str]] = []
+    for it in data.items:
+        row = conn.execute(
+            "SELECT event_id, event_type FROM custody_event WHERE event_id = ?", (it.event_id,)
+        ).fetchone()
+        if row is not None:
+            occupied.append({"event_id": it.event_id, "event_type": row["event_type"]})
+    if occupied:
+        raise DomainError(
+            409,
+            "event_conflict",
+            f"批次含已占用的事件号 {len(occupied)} 个（整批失败，不落任何事件或批次）",
+            {"occupied_event_ids": [x["event_id"] for x in occupied], "events": occupied},
+        )
+
+    # 4) 写批次头，再按提交顺序写各份 transfer 事件（均带 batch_pk 原始归属）
+    try:
+        batch_cur = conn.execute(
+            "INSERT INTO transfer_batch"
+            " (batch_id, handed_over_at, from_custodian, to_custodian, content_hash, created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (data.batch_id, canonical["handed_over_at"], data.from_custodian,
+             data.to_custodian, h, utcnow_iso()),
+        )
+    except sqlite3.IntegrityError:
+        # 并发下同批次号竞争：重读按幂等/冲突处理
+        raced = _get_batch(conn, data.batch_id)
+        if raced is not None and raced["content_hash"] == h:
+            return raced, True
+        raise DomainError(409, "batch_conflict", f"批次号 {data.batch_id} 并发提交且内容冲突")
+    batch_pk = batch_cur.lastrowid
+
+    now = utcnow_iso()
+    for it in data.items:
+        ev_in = EventIn(
+            event_id=it.event_id,
+            event_type="transfer",
+            sample_code=it.sample_code,
+            occurred_at=data.handed_over_at,
+            transfer_no=it.transfer_no,
+            from_custodian=data.from_custodian,
+            to_custodian=data.to_custodian,
+        )
+        ev_canonical, payload = _event_canonical(ev_in)
+        ev_hash = _fingerprint(ev_canonical)
+        try:
+            conn.execute(
+                "INSERT INTO custody_event"
+                " (sample_id, event_id, event_type, occurred_at, payload_json, content_hash,"
+                "  created_at, superseded_by, replaces_event_id, batch_pk)"
+                " VALUES (?,?,?,?,?,?,?,NULL,NULL,?)",
+                (sample_rows[it.sample_code]["id"], it.event_id, "transfer",
+                 ev_canonical["occurred_at"],
+                 json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                 ev_hash, now, batch_pk),
+            )
+        except sqlite3.IntegrityError:
+            # 并发事件号竞争（本事务 IMMEDIATE 串行下仅极端竞态可能）：整批回滚
+            raise DomainError(
+                409, "event_conflict",
+                f"事件号 {it.event_id} 已被并发占用（整批失败）",
+                {"event_id": it.event_id},
+            )
+
+    return conn.execute("SELECT * FROM transfer_batch WHERE id = ?", (batch_pk,)).fetchone(), False
+
+
+def _batch_item_rows(conn: sqlite3.Connection, batch_pk: int) -> list[sqlite3.Row]:
+    """批次内各份样本（按提交顺序 = 行 id 升序）。"""
+    return conn.execute(
+        "SELECT ce.*, s.sample_code AS sample_code"
+        " FROM custody_event ce JOIN sample s ON s.id = ce.sample_id"
+        " WHERE ce.batch_pk = ? ORDER BY ce.id ASC",
+        (batch_pk,),
+    ).fetchall()
+
+
+def batch_header_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "batch_id": row["batch_id"],
+        "handed_over_at": row["handed_over_at"],
+        "from_custodian": row["from_custodian"],
+        "to_custodian": row["to_custodian"],
+        "created_at": row["created_at"],
+    }
+
+
+def build_batch_result(conn: sqlite3.Connection, batch: sqlite3.Row) -> dict[str, Any]:
+    """批次查询/提交结果：批次头 + 逐份样本的当前核验结论与原事件是否仍有效。"""
+    items: list[dict[str, Any]] = []
+    for ev in _batch_item_rows(conn, batch["id"]):
+        sample = conn.execute(
+            "SELECT * FROM sample WHERE id = ?", (ev["sample_id"],)
+        ).fetchone()
+        evaluation = evaluate(conn, sample)
+        items.append({
+            "sample_code": ev["sample_code"],
+            "event_id": ev["event_id"],
+            "transfer_no": json.loads(ev["payload_json"])["transfer_no"],
+            "event_effective": ev["superseded_by"] is None,
+            "superseded_by": ev["superseded_by"],
+            "evaluation": evaluation_summary(evaluation, dict(sample)),
+        })
+    return {"batch": batch_header_dict(batch), "total": len(items), "items": items}
+
+
+def get_transfer_batch(conn: sqlite3.Connection, batch_id: str) -> dict[str, Any]:
+    row = _get_batch(conn, batch_id)
+    if row is None:
+        raise DomainError(404, "batch_not_found", f"批次不存在: {batch_id}")
+    return build_batch_result(conn, row)
+
+
+def list_transfer_batches(conn: sqlite3.Connection) -> dict[str, Any]:
+    rows = conn.execute(
+        "SELECT b.*, (SELECT COUNT(*) FROM custody_event ce WHERE ce.batch_pk = b.id) AS item_count"
+        " FROM transfer_batch b ORDER BY b.id ASC"
+    ).fetchall()
+    return {
+        "total": len(rows),
+        "items": [{**batch_header_dict(r), "item_count": r["item_count"]} for r in rows],
+    }
