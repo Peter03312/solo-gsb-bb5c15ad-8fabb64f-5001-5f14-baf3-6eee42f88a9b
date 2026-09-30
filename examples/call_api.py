@@ -1,4 +1,5 @@
-"""零依赖（仅标准库）的 HTTP API 调用示例：完整演示登记→移交→签收→检查→入库→查询→核定。
+"""零依赖（仅标准库）的 HTTP API 调用示例：完整演示登记→移交→签收→检查→入库→查询→核定，
+以及车次移交批次（整批提交 / 幂等重试 / 核定后重试 / 纠错后批次查询 / 整批失败不留痕）。
 
 使用前：
     pip install 无额外要求（urllib 为 Python 标准库）
@@ -203,6 +204,89 @@ def main() -> None:
     show("纠错-作废（原记录留痕、核验剔除）", s, r, "evaluation", "status")
     s, r = call("GET", f"/samples/{code2}/corrections")
     show("纠错审计查询", s, r)
+
+    # 12) 车次移交批次：同一车次多份样本的移交作为既有 transfer 事件一次提交
+    code_a = f"API-BATCH-A-{run_id}"
+    code_b = f"API-BATCH-B-{run_id}"
+    for c_code in (code_a, code_b):
+        call("POST", "/samples", {
+            "sample_code": c_code,
+            "collected_at": "2026-09-30T01:00:00Z",
+            "collector": "王采集",
+            "seal_no": f"SEAL-{c_code}",
+        })
+    batch_body = {
+        "batch_id": f"API-BATCH-{run_id}",
+        "transfer_time": "2026-09-30T02:00:00Z",
+        "from_custodian": "王采集",
+        "to_custodian": "李运输",
+        "note": "同一车次（京A-12345）批量移交",
+        "items": [
+            {"sample_code": code_a, "transfer_no": f"TR-BA-{run_id}", "event_id": f"API-BA-T-{run_id}"},
+            {"sample_code": code_b, "transfer_no": f"TR-BB-{run_id}", "event_id": f"API-BB-T-{run_id}"},
+        ],
+    }
+    s, r = call("POST", "/transfer-batches", batch_body)
+    show("批次移交（201，逐份返回当前结论）", s, r)
+    for it in r.get("items", []):
+        print("  -", it["sample_code"], it["evaluation"]["status"],
+              "| 原事件有效:", it["original_event_effective"])
+
+    # 12.1) 同批次号同内容重试 → 200 幂等（批内顺序打乱亦可）
+    retry_body = dict(batch_body)
+    retry_body["items"] = list(reversed(batch_body["items"]))
+    s, r = call("POST", "/transfer-batches", retry_body)
+    show("同批次同内容重试（乱序仍幂等 200）", s, r, "total")
+
+    # 12.2) 批次内各份就是既有 transfer 事件：用单事件接口同号同内容重试仍 200
+    s, r = call("POST", "/events", {
+        "event_id": f"API-BA-T-{run_id}", "event_type": "transfer", "sample_code": code_a,
+        "occurred_at": "2026-09-30T02:00:00Z",
+        "transfer_no": f"TR-BA-{run_id}", "from_custodian": "王采集", "to_custodian": "李运输",
+    })
+    show("批次事件经单事件接口同内容重试（200）", s, r, "idempotent")
+
+    # 12.3) 给 A 补齐签收/入库并核定；批次查询逐份反映最新结论与原事件有效性
+    call("POST", "/events", {
+        "event_id": f"API-BA-R-{run_id}", "event_type": "receive", "sample_code": code_a,
+        "occurred_at": "2026-09-30T03:00:00Z", "transfer_no": f"TR-BA-{run_id}",
+        "receiver": "李运输", "seal_no": f"SEAL-{code_a}",
+    })
+    call("POST", "/events", {
+        "event_id": f"API-BA-S-{run_id}", "event_type": "storage", "sample_code": code_a,
+        "occurred_at": "2026-09-30T04:00:00Z", "custodian": "实验室",
+    })
+    call("POST", f"/samples/{code_a}/approve", {"approver": "质量主管"})
+    # 核定后同批次号同内容重试依然幂等
+    s, r = call("POST", "/transfer-batches", batch_body)
+    show("样本核定后同批次重试（仍 200 幂等）", s, r, "total")
+
+    # 12.4) 对 B 的批次移交提交纠错作废；再查批次：B 的原事件失效、结论变化，归属仍可追溯
+    call("POST", "/corrections", {
+        "correction_id": f"API-BA-FIX-{run_id}",
+        "sample_code": code_b,
+        "target_event_id": f"API-BB-T-{run_id}",
+        "action": "void",
+        "operator": "质控员",
+        "reason": "示例：该份未实际同车，作废批次内移交",
+    })
+    s, r = call("GET", f"/transfer-batches/{batch_body['batch_id']}")
+    show("批次查询（逐份当前结论 + 原事件是否有效）", s, r)
+    for it in r.get("items", []):
+        print("  -", it["sample_code"], "结论:", it["evaluation"]["status"],
+              "| 原事件有效:", it["original_event_effective"],
+              "| 作废/替换:", it.get("superseded_by"))
+
+    # 12.5) 典型失败：事件号已占用 → 409，且整批不留痕
+    bad_body = dict(batch_body)
+    bad_body["batch_id"] = f"API-BATCH-BAD-{run_id}"
+    bad_body["items"] = [
+        {"sample_code": code_b, "transfer_no": "TR-NOPE", "event_id": f"API-BA-T-{run_id}"},
+    ]
+    s, r = call("POST", "/transfer-batches", bad_body)
+    show("事件号被占用的批次（409，整批失败不留痕）", s, r)
+    s, r = call("GET", f"/transfer-batches/{bad_body['batch_id']}")
+    show("失败批次不可查（404 batch_not_found）", s, r)
 
 
 if __name__ == "__main__":

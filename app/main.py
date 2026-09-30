@@ -8,16 +8,19 @@ from fastapi.responses import JSONResponse
 
 from . import config
 from .db import db_session, init_db, row_to_dict
-from .schemas import ApproveIn, CorrectionIn, EventIn, SampleIn
+from .schemas import ApproveIn, BatchTransferIn, CorrectionIn, EventIn, SampleIn
 from .service import (
     DomainError,
     approve_storage,
     create_event,
     evaluate,
+    evaluation_summary,
     get_sample_or_404,
+    get_transfer_batch,
     list_corrections,
     register_sample,
     submit_correction,
+    submit_transfer_batch,
 )
 
 API_PREFIX = "/api/v1"
@@ -40,7 +43,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="样本交接链核验服务",
     description="环境检测机构样本保管链（Chain of Custody）登记、事件核验与入库核定",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -48,23 +51,6 @@ app = FastAPI(
 @app.exception_handler(DomainError)
 async def domain_error_handler(request: Request, exc: DomainError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"error": {"code": exc.code, "message": exc.message, "details": exc.details}})
-
-
-def _summary(result: dict[str, Any], sample: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "sample_code": result["sample_code"],
-        "status": result["status"],
-        "reasons": result["reasons"],
-        "current_custodian": result["current_custodian"],
-        "pending_transfer": result["pending_transfer"],
-        "has_storage": result["has_storage"],
-        "event_count": result["event_count"],
-        "collected_at": sample["collected_at"],
-        "collector": sample["collector"],
-        "seal_no": sample["seal_no"],
-        "approved_storage_at": sample["approved_storage_at"],
-        "approved_by": sample["approved_by"],
-    }
 
 
 # --------------------------------------------------------------------------- 基本信息
@@ -94,7 +80,7 @@ def register_sample_api(data: SampleIn) -> JSONResponse:
         result = evaluate(conn, sample)
         body = {
             "sample": {k: sample[k] for k in ("sample_code", "collected_at", "collector", "seal_no", "created_at")},
-            "evaluation": _summary(result, dict(sample)),
+            "evaluation": evaluation_summary(result, dict(sample)),
             "idempotent": idempotent,
         }
     return JSONResponse(status_code=200 if idempotent else 201, content=body)
@@ -104,7 +90,7 @@ def register_sample_api(data: SampleIn) -> JSONResponse:
 def list_samples_api() -> dict[str, Any]:
     with db_session() as conn:
         samples = conn.execute("SELECT * FROM sample ORDER BY id").fetchall()
-        items = [_summary(evaluate(conn, s), dict(s)) for s in samples]
+        items = [evaluation_summary(evaluate(conn, s), dict(s)) for s in samples]
     return {"total": len(items), "items": items}
 
 
@@ -113,7 +99,7 @@ def get_sample_api(sample_code: str) -> dict[str, Any]:
     with db_session() as conn:
         sample = get_sample_or_404(conn, sample_code)
         result = evaluate(conn, sample)
-        return {"sample": row_to_dict(sample), "evaluation": _summary(result, dict(sample))}
+        return {"sample": row_to_dict(sample), "evaluation": evaluation_summary(result, dict(sample))}
 
 
 @app.get(f"{API_PREFIX}/samples/{{sample_code}}/chain", tags=["samples"])
@@ -157,10 +143,37 @@ def create_event_api(data: EventIn) -> JSONResponse:
                 "payload": json.loads(row["payload_json"]),
                 "recorded_at": row["created_at"],
             },
-            "evaluation": _summary(result, dict(sample)),
+            "evaluation": evaluation_summary(result, dict(sample)),
             "idempotent": idempotent,
         }
     return JSONResponse(status_code=200 if idempotent else 201, content=body)
+
+
+# --------------------------------------------------------------------------- 车次移交批次
+
+@app.post(f"{API_PREFIX}/transfer-batches", tags=["batches"], status_code=201)
+def submit_transfer_batch_api(data: BatchTransferIn) -> JSONResponse:
+    """同一车次多份样本的移交批次：将各份移交作为既有 transfer 事件一次提交。
+
+    * 批内样本编号/事件号重复、样本不存在或已核定、任一事件号已占用 → 整批失败不留痕；
+    * 同批次号同内容重试 → 200 幂等（样本已核定亦然）；异内容 → 409 batch_conflict；
+    * 并发提交与核定按已提交顺序判定（写事务 BEGIN IMMEDIATE 串行）；
+    * 响应逐份返回写入后当前核验结论及原事件有效性（新建时均为 true）。
+    """
+    with db_session(immediate=True) as conn:
+        body, idempotent = submit_transfer_batch(conn, data)
+    return JSONResponse(status_code=200 if idempotent else 201, content=body)
+
+
+@app.get(f"{API_PREFIX}/transfer-batches/{{batch_id}}", tags=["batches"])
+def get_transfer_batch_api(batch_id: str) -> dict[str, Any]:
+    """批次查询：公共字段 + 逐份样本当前核验结论及原移交事件是否仍有效。
+
+    后续作废/替换纠错仅改变有效链与这里的核验结论；批次原始归属（移交单号/原事件号）
+    永久保留可追溯。
+    """
+    with db_session() as conn:
+        return get_transfer_batch(conn, batch_id)
 
 
 # --------------------------------------------------------------------------- 事件纠错
@@ -195,4 +208,4 @@ def approve_api(sample_code: str, data: ApproveIn) -> dict[str, Any]:
     with db_session(immediate=True) as conn:
         result = approve_storage(conn, sample_code, data)
         sample = get_sample_or_404(conn, sample_code)
-        return {"evaluation": _summary(result, dict(sample)), "approval": result["approval"]}
+        return {"evaluation": evaluation_summary(result, dict(sample)), "approval": result["approval"]}

@@ -23,6 +23,11 @@
 | 事件幂等 | 同一 `event_id` + 同内容（SHA-256 指纹）重试 → 幂等返回 HTTP 200；同 `event_id` 异内容 → HTTP 409 冲突（核定后亦保持此兼容行为） |
 | 核定前纠错 | 核定前可按样本编号 + 当前有效事件号提交**作废（void）/替换（replace）**，附全局唯一纠错号、操作人、原因；替换须给完整新事件内容与**未占用**的新事件号。原事件与纠错关系永久留痕，核验仅纳入有效版本并按发生时间重算结论/原因/当前保管人；被替换记录可经链查询追溯。纠错**不得跨样本**；同纠错号同内容重试幂等（200）、异内容冲突（409）；并发针对同一有效版本仅一次成功，失败不改链。核定入库后拒绝纠错 |
 | 纠错与核定并发 | 写事务以 `BEGIN IMMEDIATE` 串行：先提交者生效，后到者看到其已提交结果——作废先提交则核定基于最终有效链（非 valid 则 422），核定先提交则纠错被 `history_locked` 拒绝 |
+| 车次移交批次 | 同一车次可一次提交多份样本的 transfer：全局唯一**批次号** + 统一移交时间/交出人/接收人 + 逐份（样本编号、移交单号、事件号），各份作为**既有 transfer 事件**落库 |
+| 批次整批失败 | 批内样本编号或事件号重复、任一样本不存在或**已核定**、任一事件号已占用 → 整批失败，**不留下任何事件或批次**（事务回滚） |
+| 批次幂等/冲突 | 同批次号**同内容**重试幂等（HTTP 200，即使样本已核定；批内顺序不同不影响）；异内容 → `409 batch_conflict`。批次事件与单事件接口互认同一内容指纹 |
+| 批次查询 | 返回逐份样本的**当前核验结论**及**原移交事件是否仍有效**；后续作废/替换只改有效链与查询结果，批次原始归属（移交单号/原事件号）永久可追溯 |
+| 批次并发 | 批次提交、单事件上报与核定同在 `BEGIN IMMEDIATE` 写锁内串行，按**已提交顺序**判定；竞争同一新事件号的批次恰有一批成功，败者整批回滚 |
 | 入库核定 | 仅 `valid` 可核定；核定后该样本登记与事件全部**拒绝改写**（HTTP 409），重复核定幂等 |
 
 > 说明：任何事件发生时间早于样本采集时间，直接记为无效（采集前不可能发生保管动作）。
@@ -166,7 +171,90 @@ curl -X POST http://localhost:8080/api/v1/events -H 'Content-Type: application/j
 - 新事件 `201`；同 `event_id` 同内容重试 `200`（`idempotent: true`）；异内容 `409 event_conflict`。
 - 响应中 `evaluation.status` / `reasons` / `current_custodian` 为写入后重算结果。
 
-### 5.3 查询
+### 5.3 车次移交批次（多份样本一次提交）
+
+同一交接车次可能涉及多份样本。批次接口提交全局唯一**批次号**、统一移交时间、交出人、接收人，以及每份样本的编号、移交单号、事件号；批内各份移交作为**既有 `transfer` 事件**一次提交。
+
+`POST /api/v1/transfer-batches`
+
+```bash
+curl -X POST http://localhost:8080/api/v1/transfer-batches \
+  -H 'Content-Type: application/json' -d '{
+  "batch_id":"BATCH-20260930-01",
+  "transfer_time":"2026-09-30T02:00:00Z",
+  "from_custodian":"王采集",
+  "to_custodian":"李运输",
+  "note":"同一车次（京A-12345）批量移交（可选）",
+  "items":[
+    {"sample_code":"S-001","transfer_no":"TR-1","event_id":"EVT-T1"},
+    {"sample_code":"S-002","transfer_no":"TR-2","event_id":"EVT-T2"}
+  ]}'
+```
+
+请求字段：
+
+| 字段 | 说明 |
+|---|---|
+| `batch_id` | 全局唯一批次号；同号重试按整批内容判定幂等/冲突 |
+| `transfer_time` | 本批统一移交时间（批内每份事件的 `occurred_at`） |
+| `from_custodian` / `to_custodian` | 交出人 / 接收人（整批一致，分别写入每份 transfer） |
+| `items[]` | 至少一份；每份含 `sample_code`、`transfer_no`、`event_id`（事件类型固定 transfer） |
+| `note` | 可选批次备注；参与批次指纹，但不写入单事件内容 |
+
+- 成功 `201`；响应逐份返回写入后的**当前核验结论**与原事件有效性（新建时均为 `true`）。
+- 同 `batch_id` **同内容**重试（即使批内顺序打乱、即使样本已核定）→ `200` 幂等；**异内容** → `409 batch_conflict`。
+- 整批失败、事务回滚，不留任何事件或批次：
+  - 批内样本编号或事件号重复 → `422 batch_duplicate_items`；
+  - 任一样本不存在 → `404 sample_not_found`；
+  - 任一样本已核定入库 → `409 history_locked`；
+  - 任一事件号已被占用（含其它批次、单事件、纠错历史留痕）→ `409 event_id_occupied`。
+- 批内每份就是一条普通 `transfer` 事件：可被正常签收关闭、参与重算；其内容指纹与单事件接口完全一致——经 `POST /events` 用同 `event_id` 同内容重试返回 `200`、异内容返回 `409`，反之单事件先占用的事件号批次也不能再用。
+
+批次查询 `GET /api/v1/transfer-batches/{batch_id}`：
+
+```bash
+curl http://localhost:8080/api/v1/transfer-batches/BATCH-20260930-01
+```
+
+```json
+{
+  "batch_id": "BATCH-20260930-01",
+  "transfer_time": "2026-09-30T02:00:00Z",
+  "from_custodian": "王采集",
+  "to_custodian": "李运输",
+  "note": "同一车次（京A-12345）批量移交（可选）",
+  "created_at": "2026-09-30T02:00:05Z",
+  "total": 2,
+  "items": [
+    {
+      "position": 0,
+      "sample_code": "S-001",
+      "transfer_no": "TR-1",
+      "event_id": "EVT-T1",
+      "evaluation": {"status": "valid", "current_custodian": "实验室", "...": "..."},
+      "original_event_effective": true,
+      "superseded_by": null
+    },
+    {
+      "position": 1,
+      "sample_code": "S-002",
+      "transfer_no": "TR-2",
+      "event_id": "EVT-T2",
+      "evaluation": {"status": "pending", "...": "..."},
+      "original_event_effective": false,
+      "superseded_by": "FIX-0007",
+      "correction_action": "replace",
+      "replacement_event_id": "EVT-T2-FIX"
+    }
+  ]
+}
+```
+
+- `evaluation` 为该份样本**查询时刻**的核验结论（重算）；`original_event_effective=false` 表示该份原始移交已被作废/替换，并由 `superseded_by` 给出纠错号、`correction_action`（`void`/`replace`）、`replacement_event_id`（替换时）。
+- 后续作废 / 替换纠错只改变有效链与这里的核验结论；**批次原始归属**（`transfer_no` / `event_id` / 批次号）永久保留。被作废/替换的原批次事件同时可经 `GET /api/v1/samples/{sample_code}/chain` 的 `superseded_events`（含 `batch_id`）追溯。
+- 未知批次号 → `404 batch_not_found`。
+
+### 5.4 查询
 
 | 方法与路径 | 说明 |
 |---|---|
@@ -207,7 +295,7 @@ curl http://localhost:8080/api/v1/samples/S-001/chain
 - `superseded_events` 为被作废/替换的原始事件，仅用于追溯，不参与核验；
 - `corrections` 为该样本全部纠错留痕（永久保留，核定后仍可查）。
 
-### 5.4 入库核定
+### 5.5 入库核定
 
 `POST /api/v1/samples/{sample_code}/approve`
 
@@ -220,7 +308,7 @@ curl -X POST http://localhost:8080/api/v1/samples/S-001/approve \
 - 核定后再上报事件或改写登记 → `409 history_locked`；重复核定幂等返回。
 - 核定与纠错并发时，核定只可能基于**最终已提交的有效链**判定。
 
-### 5.5 事件纠错（核定前：作废 / 替换）
+### 5.6 事件纠错（核定前：作废 / 替换）
 
 `POST /api/v1/corrections`
 
@@ -274,7 +362,7 @@ curl http://localhost:8080/api/v1/samples/S-001/corrections
 # {"sample_code":"S-001","total":2,"items":[{"correction_id":"FIX-0002", ...}]}
 ```
 
-被替换记录通过 `GET /api/v1/samples/{sample_code}/chain` 的 `superseded_events` / `corrections` 字段追溯（见 5.3）。
+被替换记录通过 `GET /api/v1/samples/{sample_code}/chain` 的 `superseded_events` / `corrections` 字段追溯（见 5.4；批次移交的原始事件同样带 `batch_id` 留痕）。
 
 ### 错误响应统一格式
 
@@ -284,13 +372,16 @@ curl http://localhost:8080/api/v1/samples/S-001/corrections
 
 | HTTP | code | 触发 |
 |---|---|---|
-| 404 | `sample_not_found` / `event_not_found` | 样本不存在 / 纠错目标事件不存在 |
+| 404 | `sample_not_found` / `event_not_found` / `batch_not_found` | 样本不存在 / 纠错目标事件不存在 / 批次号不存在 |
 | 409 | `sample_conflict` / `event_conflict` | 同编号异内容 / 同事件号异内容 |
-| 409 | `history_locked` | 已核定入库后改写历史或纠错 |
+| 409 | `history_locked` | 已核定入库后改写历史或纠错（含批次内含已核定样本） |
 | 409 | `correction_conflict` | 同纠错号异内容（含动作 void↔replace 不一致） |
 | 409 | `correction_cross_sample` | 纠错目标事件不属于提交的样本（禁止跨样本） |
 | 409 | `event_not_effective` | 目标事件已被作废/替换，或并发下被抢先纠错（非当前有效版本） |
 | 409 | `new_event_id_occupied` | 替换所用新事件号已被占用 |
+| 409 | `batch_conflict` | 同批次号异内容（公共字段、份内编号/移交单/事件号集合或备注不一致） |
+| 409 | `event_id_occupied` | 批次内某事件号已被占用（或并发批次竞争失败） |
+| 422 | `batch_duplicate_items` | 批次内样本编号或事件号重复（整批拒绝、不留痕） |
 | 422 | `approval_rejected` | 非有效链尝试核定（或 Pydantic 字段校验失败） |
 
 ---
@@ -303,7 +394,7 @@ curl http://localhost:8080/api/v1/samples/S-001/corrections
 python examples/call_api.py
 ```
 
-脚本依次演示：登记 → 移交 → 签收 → 封签检查 → 入库 → 幂等重试 → 冲突 → 查询证据链 → **纠错替换 / 同号幂等 / 链追溯 / 作废演示 / 纠错审计查询** → 核定 → 核定后改写与纠错被拒。也可直接在 http://localhost:8080/docs 的 Swagger UI 中点击调用。
+脚本依次演示：登记 → 移交 → 签收 → 封签检查 → 入库 → 幂等重试 → 冲突 → 查询证据链 → **纠错替换 / 同号幂等 / 链追溯 / 作废演示 / 纠错审计查询** → 核定 → 核定后改写与纠错被拒 → **车次移交批次（整批提交 / 乱序幂等 / 与单事件接口互认 / 核定后重试 / 作废后批次查询 / 整批失败不留痕）**。也可直接在 http://localhost:8080/docs 的 Swagger UI 中点击调用。
 
 ---
 
@@ -311,11 +402,13 @@ python examples/call_api.py
 
 ```bash
 python -m tests.test_chain          # 既有规则：42 项断言
-python -m tests.test_corrections    # 本轮纠错：62 项断言（含并发）
+python -m tests.test_corrections    # 纠错：65 项断言（含并发）
+python -m tests.test_batches        # 本轮批次移交：79~80 项断言（含并发，可重复运行）
 ```
 
 - `test_chain` 覆盖 14 类场景：登记幂等/冲突、四类无效情形（非保管人移交、在途再移交、签收四要素不符、重复签收、封签不符/破损）、待补证两情形、乱序补录重算、核定准入与冻结、事件早于采集、无效优先等。
 - `test_corrections` 覆盖：作废后仅有效版本重算（结论/原因/保管人）、替换生效与多跳替换、原事件与纠错关系留痕及链追溯、审计查询、同纠错号幂等/异内容冲突、跨样本拒绝、非有效版本拒绝、新事件号占用、replace/void 载荷校验、核定后拒绝纠错、同事件号 200/409 兼容、同有效版本并发仅一次成功、纠错与核定并发两种合法结局（可重复运行）。
+- `test_batches` 覆盖：整批提交为既有 transfer 事件（逐份归属/时间线/可签收入库）、整批失败不留痕的全部情形（批内重复、样本缺失、已核定、事件号占用）、同批次号同内容幂等（乱序、核定后）/异内容冲突、批次与单事件接口指纹互认（200/409）、批次查询逐份结论与原事件有效性、作废/替换只改有效链而批次归属可追溯、批次与核定并发的两种合法结局、并发批次竞争事件号恰一批成功且败者无残留、请求体校验、既有接口行为不变（可重复运行）。
 
 ---
 
@@ -325,14 +418,15 @@ python -m tests.test_corrections    # 本轮纠错：62 项断言（含并发）
 .
 ├── app/
 │   ├── main.py       # FastAPI 路由、异常映射、启动初始化
-│   ├── service.py    # 核心领域逻辑：幂等指纹、保管链重算、纠错（作废/替换）、核定冻结
-│   ├── schemas.py    # 请求模型：事件、纠错（NewEventIn/CorrectionIn）按类型必填校验
+│   ├── service.py    # 核心领域逻辑：幂等指纹、保管链重算、纠错（作废/替换）、车次移交批次、核定冻结
+│   ├── schemas.py    # 请求模型：事件、批次（BatchTransferIn）、纠错（NewEventIn/CorrectionIn）按类型必填校验
 │   ├── db.py         # SQLite 连接、建表与旧库迁移、IMMEDIATE 事务
 │   ├── seed.py       # 演示数据初始化（幂等）
 │   └── config.py     # 环境变量配置
-├── examples/call_api.py   # 零依赖调用示例（含纠错全流程）
+├── examples/call_api.py   # 零依赖调用示例（含纠错、移交批次全流程）
 ├── tests/test_chain.py    # 既有规则端到端自测（42 项断言）
-├── tests/test_corrections.py  # 纠错端到端自测（62 项断言，含并发）
+├── tests/test_corrections.py  # 纠错端到端自测（65 项断言，含并发）
+├── tests/test_batches.py  # 车次移交批次端到端自测（79~80 项断言，含并发）
 ├── entrypoint.sh     # 容器入口：建表 → 演示数据 → 启动
 ├── Dockerfile
 ├── docker-compose.yml
